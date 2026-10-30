@@ -141,12 +141,19 @@ end
 
 OCR only runs while a script is running.
 
-`scripts/smilebasic_runner.lua` is a fuller example: it walks the console to
-SmileBASIC 4's Direct mode, types `LOAD "TXT:NS2"`, `RUN` and
-`REMOVE NSR,&H60000000,&H3FFFFFFF`, then types `V=START(39380,<this PC>,...)`
-and waits for `HOST CONNECTED` or `BOOT FAILED`.  Edit `HOST` at the top of the
-script to this PC's address on the network the console can reach.  It expects
-the NS2 program saved in slot 0 and a listener on TCP 39380.
+`scripts/smilebasic_runner.lua` is a fuller example: it stops any leftover copy
+of the NS2 host in `third_party/ns2jb` (Node 22+; that folder is local-only and
+not part of this repository — set `NS2_DIR` if yours lives elsewhere), starts a
+fresh one, reads the `V=START(...)` line it writes, walks the console to
+SmileBASIC 4's Direct
+mode, types `LOAD "TXT:NS2"`, `RUN` and `REMOVE NSR,&H60000000,&H3FFFFFFF`,
+sends START, and reports the verification result.  The host's output
+(`1/4` … `4/4`) is forwarded into the script log, and the script waits until
+the host reports — there is no timeout; Stop ends it.  The host is stopped
+again if the run bails out.  The console-facing address is reused from the
+previous run (set `NS2_HOST` to override it); the NS2 program must already be
+saved in slot 0.  Run folders and the host log go to
+`$XDG_STATE_HOME/switchview/ns2`.
 
 ## Repository layout
 
@@ -156,6 +163,7 @@ the NS2 program saved in slot 0 and a listener on TCP 39380.
 | `firmware/` | Pico 2 W firmware (TinyUSB composite device, lwIP UDP) |
 | `proto/switchview_proto.h` | Wire protocol shared by the app and the firmware |
 | `scripts/` | Lua scripts |
+| `third_party/ns2jb/` | Local-only NS2 host folder (git-ignored, not distributed) |
 | `tools/pico_ctl.py` | Command-line client for scripted taps and text |
 
 ## Fonts
@@ -191,3 +199,6 @@ Pro Controller USB IDs for compatibility. Use at your own risk.
 ## License
 
 MIT © RavensClawX. See [LICENSE](LICENSE).
+
+The NS2 host is not distributed with this project: `third_party/` is
+git-ignored, local-only, and not covered by this project's MIT license.

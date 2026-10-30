@@ -816,12 +816,16 @@ static void render_script_panel(struct panel *p)
   int fit = (int)((lb.h - SS(p, 20)) / (lh ? lh : 14));
   if (fit > SCRIPT_LOG_LINES) fit = SCRIPT_LOG_LINES;
   int nl = script_log(p->script, lines, fit);
+  // Keep long lines inside the card instead of spilling over the panel.
+  SDL_Rect clip = {(int)lb.x + 2, (int)lb.y + 2, (int)lb.w - 4, (int)lb.h - 4};
+  SDL_RenderSetClipRect(r, &clip);
   for (int i = 0; i < nl; i++) {
     const char *t = lines[i];
     SDL_Color c = !strncmp(t, "error", 5) ? (SDL_Color){200, 60, 60, 255}
                 : t[0] == '>' ? C_ACCENT : C_TEXT;
     draw_text(p, t, 0, c, (int)(lb.x + SS(p, 14)), (int)(lb.y + SS(p, 10) + lh * i + lh / 2), 1);
   }
+  SDL_RenderSetClipRect(r, NULL);
 }
 
 void panel_render(struct panel *p, const SDL_Rect *area, const char *status)

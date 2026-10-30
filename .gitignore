@@ -5,3 +5,4 @@ firmware/secrets.cmake
 app/fonts/*.ttf
 app/fonts/*.otf
 tools/__pycache__/
+third_party/

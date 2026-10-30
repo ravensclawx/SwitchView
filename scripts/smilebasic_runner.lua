@@ -1,15 +1,21 @@
--- Drive SmileBASIC 4 through the NS2 demo's startup commands.
+-- Drive SmileBASIC 4 through the NS2 demo, start to finish.
 --
--- The script only presses buttons and types: it walks the console to Direct
--- mode, then enters LOAD "TXT:NS2", RUN and the REMOVE line, checking each
--- screen with OCR before moving on.  Nothing is typed if a step's screen does
--- not match, so a stray dialog cannot make it fire the next command.
+-- The host helper lives in third_party/ns2jb and is started for you: this
+-- script spawns it, reads the V=START(...) line it writes to its newest run
+-- folder, then drives the console with button presses and typed text.  The
+-- host's output is forwarded to the script log, and the script waits for its
+-- verdict from result.json without a timeout - press Stop to end it.  The
+-- address the console dials comes from the previous run, so there is nothing
+-- to edit.
 --
--- NS2 must already be saved in slot 0, and something must be listening on
--- TCP 39380 before the last step.  Set HOST below to this PC's address on the
--- link the console can reach (NS2_HOST / NS2_START override it).
+-- NS2 must already be saved in slot 0.  Run folders and the host log live
+-- under $XDG_STATE_HOME/switchview/ns2 (default ~/.local/state/...), not in
+-- the source tree.
+--
+-- Overrides: NS2_DIR (host folder), NS2_NODE (Node 22+ binary),
+-- NS2_HOST (address the console dials), NS2_START (full START line).
 
-local PORT = 39380             -- port the demo connects back to
+local PORT = 39380
 
 rule("error-code", "error code")
 rule("loaded", "dist boot ready")
@@ -19,22 +25,49 @@ rule("home", "smilebasic")
 rule("load-confirm", "load the file")
 rule("tag-dialog", "tag information")
 
+-- ---------------- helpers ----------------
+
+local function sh(cmd)
+  local p = io.popen(cmd .. " 2>/dev/null")
+  if not p then return "" end
+  local out = p:read("*a") or ""
+  p:close()
+  return out
+end
+
+local function first_line(cmd)
+  local p = io.popen(cmd .. " 2>/dev/null")
+  if not p then return nil end
+  local line = p:read("*l")
+  p:close()
+  if line == "" then return nil end
+  return line
+end
+
+local function read_all(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local body = f:read("*a")
+  f:close()
+  return body
+end
+
+local function read_line(path)
+  local body = read_all(path)
+  return body and body:match("^([^\n]*)")
+end
+
+local function exists(path)
+  local f = io.open(path, "r")
+  if f then f:close() return true end
+  return false
+end
+
 local function enter(line)
-  -- The console applies Caps Lock to USB keyboard letters: sending shifted
-  -- (upper-case) text with Caps on lands as lower-case.  So send unshifted
-  -- text and let Caps produce the upper-case on screen.  When the console
-  -- reports Caps off, literal text is already correct.
-  if capslock() ~= false then line = line:lower() end
   type(line .. "\n")
   sleep(0.4)
 end
 
--- Type this PC's address on the link the console can reach.  NetworkManager's
--- shared-Ethernet default is 10.42.0.1; NS2_HOST overrides it.
-local HOST = os.getenv("NS2_HOST") or "10.42.0.1"
-
--- The console can pop an Error Code dialog (e.g. 2155-8007) at any point.
--- "Close" is the focused button, so A dismisses it.
 local function dismiss_error()
   if find("error code") then
     tap("A"); sleep(2)
@@ -43,7 +76,6 @@ local function dismiss_error()
   return false
 end
 
--- Wait for `word`, dismissing error dialogs that appear meanwhile.
 local function expect(word, timeout)
   local deadline = os.time() + timeout
   while os.time() < deadline do
@@ -54,7 +86,6 @@ local function expect(word, timeout)
   return false
 end
 
--- Wait for whichever of two words appears first.
 local function expect_any(a, b, timeout)
   local deadline = os.time() + timeout
   while os.time() < deadline do
@@ -65,6 +96,184 @@ local function expect_any(a, b, timeout)
   end
   return nil
 end
+
+-- ---------------- host side ----------------
+
+-- The app loads us as <repo>/scripts/<name>.lua, so our own source path is
+-- the most reliable way to find the repo; the executable path is a fallback.
+local src = ((debug.getinfo(1, "S") or {}).source or ""):gsub("^@", "")
+local root = src:match("^(.*)/scripts/[^/]+$")
+if not root then
+  local exe = first_line("readlink /proc/self/exe") or ""
+  root = exe:match("^(.*)/app/[^/]+$") or exe:match("^(.*)/[^/]+$") or "."
+end
+
+local hostdir = os.getenv("NS2_DIR")
+if not hostdir or hostdir == "" then hostdir = root .. "/third_party/ns2jb" end
+hostdir = first_line("realpath '" .. hostdir .. "'") or hostdir
+
+local function find_node()
+  local env = os.getenv("NS2_NODE")
+  if env and env ~= "" then return env end
+  local found = first_line("command -v node")
+  if found then return found end
+  for _, guess in ipairs{root .. "/tools/node", root .. "/../tools/node"} do
+    if exists(guess) then return guess end
+  end
+  return nil
+end
+
+local function runs_dir()
+  local base = os.getenv("XDG_STATE_HOME")
+  if not base or base == "" then
+    local home = os.getenv("HOME")
+    if not home then return nil end
+    base = home .. "/.local/state"
+  end
+  return base .. "/switchview/ns2/runs"
+end
+
+local RUNS = runs_dir()
+local HOST_LOG = RUNS and RUNS:gsub("/runs$", "") .. "/host.log" or "/tmp/switchview-ns2.log"
+
+-- The address the console dials: NS2_HOST, else the one the last run used
+-- (the host records it in connect.txt), else the shared-link default.
+local function last_host()
+  if not RUNS then return nil end
+  local path = first_line('ls -1t "' .. RUNS .. '"/switch2-*/connect.txt')
+  local line = path and read_line(path)
+  if not line then return nil end
+  local a, b, c, d = line:match("^V=START%(%d+,(%d+),(%d+),(%d+),(%d+)%)")
+  if not a then return nil end
+  return table.concat({a, b, c, d}, ".")
+end
+
+-- Only reuse an address this PC still has; a stale one from another network
+-- would make the host fail to bind.
+local function local_ip(ip)
+  return sh("ip -4 -o addr show scope global"):find("inet " .. ip .. "/", 1, true) ~= nil
+end
+
+local HOST = os.getenv("NS2_HOST")
+if not HOST or HOST == "" then
+  HOST = last_host()
+  if not HOST or not local_ip(HOST) then HOST = "10.42.0.1" end
+end
+
+-- Forward new lines from the host's own output into the script log, so the
+-- 1/4 .. 4/4 progress is visible while the script waits.
+local owns_host = false
+local host_pid
+local log_offset = 0
+local function tail_host_log()
+  if not owns_host or not HOST_LOG then return end
+  local f = io.open(HOST_LOG, "r")
+  if not f then return end
+  f:seek("set", log_offset)
+  local chunk = f:read("*a") or ""
+  f:close()
+  if chunk == "" then return end
+  log_offset = log_offset + #chunk
+  for line in chunk:gmatch("[^\r\n]+") do
+    local trimmed = line:gsub("^%s+", "")
+    -- Same style as our own lines: no trailing full stop.
+    if trimmed:sub(-1) == "." and trimmed:sub(-2) ~= ".." then
+      trimmed = trimmed:sub(1, -2)
+    end
+    -- Skip the host's printed instructions; keep status and stage lines.
+    local banner = line:match("^%s%s") or trimmed:match("^In a freshly opened")
+      or trimmed:match("^After the expected") or trimmed:match("^If BASIC says")
+      or trimmed:match("^Run folder:")
+    if trimmed ~= "" and not banner then log(trimmed) end
+  end
+end
+
+-- Newest run folder that has not finished yet (result.json absent).
+local function waiting_run()
+  if not RUNS then return nil end
+  local p = io.popen('ls -1t "' .. RUNS .. '"/switch2-*/connect.txt 2>/dev/null')
+  if not p then return nil end
+  local found
+  for line in p:lines() do
+    local dir = (line:gsub("/connect%.txt$", ""))
+    if not exists(dir .. "/result.json") then found = dir; break end
+  end
+  p:close()
+  return found
+end
+
+local function listener_pid()
+  return tonumber(sh("ss -Hltnp 'sport = :" .. PORT .. "'"):match("pid=(%d+)"))
+end
+
+local function alive(pid)
+  return pid ~= nil and first_line("readlink /proc/" .. pid .. "/exe") ~= nil
+end
+
+-- True when a listener is the copy this script starts (its working directory
+-- is the vendored host folder).
+local function our_host(pid)
+  return first_line("readlink /proc/" .. pid .. "/cwd") == hostdir
+end
+
+-- Stop the host this script started, or a leftover copy from an earlier run.
+-- A listener belonging to something else is left alone.
+local function despawn_host()
+  local pid = host_pid
+  if not alive(pid) then
+    pid = listener_pid()
+    if not pid then host_pid = nil; return true end
+    if not our_host(pid) then
+      log("Port " .. PORT .. " in use by another program - left alone")
+      return false
+    end
+  end
+  os.execute("kill -TERM " .. pid)
+  for _ = 1, 20 do
+    if not alive(pid) then host_pid = nil; return true end
+    sleep(0.2)
+  end
+  os.execute("kill -KILL " .. pid)
+  sleep(0.2)
+  host_pid = nil
+  return not alive(pid)
+end
+
+local function start_host(node)
+  if not RUNS then return false end
+  log_offset = 0                 -- the redirect below truncates host.log
+  os.execute("mkdir -p '" .. RUNS .. "'")
+  local cmd = string.format(
+    "cd '%s' && NS2_RUNS_DIR='%s' nohup '%s' run.cjs '%s' >'%s' 2>&1 & echo $!",
+    hostdir, RUNS, node, HOST, HOST_LOG)
+  local p = io.popen(cmd)
+  host_pid = p and tonumber(p:read("*l"))
+  if p then p:close() end
+  log("Host started: " .. HOST)
+  return true
+end
+
+-- Fresh host for this run: stop a leftover copy, start one, wait for its run
+-- folder.
+local function ensure_host()
+  if listener_pid() and not despawn_host() then return nil end
+  local node = find_node()
+  if not node then
+    log("Node 22+ not found - set NS2_NODE")
+    return nil
+  end
+  if not start_host(node) then return nil end
+  local deadline = os.time() + 15
+  while os.time() < deadline do
+    sleep(0.5)
+    local dir = waiting_run()
+    if dir then return dir end
+  end
+  log("Host opened no run folder - see " .. HOST_LOG)
+  return nil
+end
+
+-- ---------------- console side ----------------
 
 -- HOME menu, "Make a Program", or Direct mode -> Direct mode.  Dialogs are
 -- re-checked in the loop because "Tag Information" can follow the launch.
@@ -87,63 +296,62 @@ local function to_direct()
   return nil
 end
 
--- SmileBASIC defaults to Caps Lock on; make sure it is if the console
--- reports it off.  nil means the state has not been reported yet.
-local function ensure_caps()
-  local deadline = os.time() + 5
-  while os.time() < deadline do
-    local caps = capslock()
-    if caps == true then return true end
-    if caps == false then key("capslock"); sleep(0.6) else sleep(0.2) end
-  end
-  return capslock()
+-- ---------------- run ----------------
+
+local function give_up(msg)
+  tail_host_log()
+  log(msg)
+  if owns_host then despawn_host() end
 end
 
--- Build the line now so it is logged before the console starts moving.
+-- An explicit NS2_START means a host we did not start: never touch it.
+local run_dir
 local start = os.getenv("NS2_START")
-if not start or start == "" then
-  start = "V=START(" .. PORT .. "," .. (HOST:gsub("%.", ",")) .. ")"
+if start and start ~= "" then
+  run_dir = waiting_run()
+else
+  run_dir = ensure_host()
+  owns_host = run_dir ~= nil
+  if not run_dir then
+    give_up("Host not started - console untouched (check NS2_NODE / NS2_DIR)")
+    return
+  end
+  local line = read_line(run_dir .. "/connect.txt")
+  if line and line:match("^V=START%(") then
+    start = line
+  else
+    start = "V=START(" .. PORT .. "," .. (HOST:gsub("%.", ",")) .. ")"
+  end
 end
-log("START line: " .. start)
+tail_host_log()
 
 local state = to_direct()
 if not state then
-  log("could not reach SmileBASIC Direct mode - open Make a Program and retry")
+  give_up("Not in SmileBASIC Direct mode - open Make a Program and retry")
   return
 end
 if state == "loaded" then
-  log("bootstrap already ran in this app session; restart SmileBASIC to start over")
+  give_up("Bootstrap already ran - restart SmileBASIC to start over")
   return
-end
-
-local caps = ensure_caps()
-if caps == true then
-  log("Caps Lock on")
-elseif caps == false then
-  log("Caps Lock is off and did not turn on - typed text will stay lower-case")
-else
-  log("Caps Lock state not reported; assuming SmileBASIC's default (on)")
 end
 
 enter('LOAD "TXT:NS2"')
 if expect("load the file", 8) then
   tap("A")
   sleep(1.5)
-else
-  log("no load confirmation appeared")
 end
 if not expect("bytes free", 20) then
-  log("LOAD did not return to Direct mode")
+  give_up("LOAD failed - not back in Direct mode")
   return
 end
-log('loaded NS2')
+log("NS2 loaded")
 
 enter("RUN")
 if not expect("dist boot ready", 25) then
-  log("bootstrap did not print DIST BOOT READY - is NS2 the current program?")
+  give_up("No DIST BOOT READY - is NS2 the current program?")
   return
 end
-log("bootstrap ran")
+log("Bootstrap ran")
 
 -- Expected "Out of memory"; the demo's REMOVE is deliberately oversized.
 enter("REMOVE NSR,&H60000000,&H3FFFFFFF")
@@ -153,19 +361,47 @@ log("REMOVE issued")
 -- "DIST BOOT READY" stays on screen, so the screen is still labelled
 -- "loaded"; the status line is what proves we are back at the prompt.
 if not expect("bytes free", 10) then
-  log("not back in Direct mode after REMOVE")
+  give_up("REMOVE failed - not back in Direct mode")
   return
 end
 
 enter(start)
+local outcome = expect_any("host connected", "boot failed", 10)
+if outcome == "boot failed" then
+  give_up("BOOT FAILED - check the host address, then restart SmileBASIC")
+  return
+elseif outcome == "host connected" then
+  log("Console connected")
+end
 
--- The bootstrap prints HOST CONNECTED once the socket is up, or BOOT FAILED
--- if the address/port did not answer.  Watch for whichever comes first.
-local outcome = expect_any("host connected", "boot failed", 20)
-if outcome == "host connected" then
-  log("console connected - run is under way")
-elseif outcome == "boot failed" then
-  log("console reported BOOT FAILED - check HOST, then restart SmileBASIC")
-else
-  log("no HOST CONNECTED yet; check that the listener is running on " .. HOST)
+if not run_dir then
+  log("No run folder to watch")
+  return
+end
+
+-- Wait for the host's verdict, forwarding its progress as it happens.  No
+-- timeout: the run can take as long as it takes, and Stop ends the script.
+while true do
+  tail_host_log()
+  local result = read_all(run_dir .. "/result.json")
+  if result then
+    tail_host_log()
+    if result:find('"verified": true', 1, true) then
+      log("Verified - instructions restored, restart the console")
+    else
+      log("Host reported: " .. (result:match('"error":%s*"([^"]*)"') or "run failed"))
+      log("Details: " .. run_dir)
+    end
+    if owns_host then despawn_host() end   -- normally already exited
+    return
+  end
+  -- A host we started whose process is gone has died without a result.
+  -- (Its listening socket closes as soon as the console pairs, so the
+  -- listener disappearing is normal and not used here.)
+  if owns_host and not alive(host_pid) then
+    tail_host_log()
+    log("Host exited without a result - see " .. HOST_LOG)
+    return
+  end
+  sleep(1)
 end
