@@ -141,6 +141,13 @@ end
 
 OCR only runs while a script is running.
 
+`scripts/smilebasic_runner.lua` is a fuller example: it walks the console to
+SmileBASIC 4's Direct mode, types `LOAD "TXT:NS2"`, `RUN` and
+`REMOVE NSR,&H60000000,&H3FFFFFFF`, then types `V=START(39380,<this PC>,...)`
+and waits for `HOST CONNECTED` or `BOOT FAILED`.  Edit `HOST` at the top of the
+script to this PC's address on the network the console can reach.  It expects
+the NS2 program saved in slot 0 and a listener on TCP 39380.
+
 ## Repository layout
 
 | Path | |
