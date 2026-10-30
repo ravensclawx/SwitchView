@@ -1,0 +1,7 @@
+app/*.o
+app/switchview
+firmware/build/
+firmware/secrets.cmake
+app/fonts/*.ttf
+app/fonts/*.otf
+tools/__pycache__/
