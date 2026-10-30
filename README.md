@@ -8,6 +8,8 @@ underneath it. A Raspberry Pi Pico 2 W, plugged into the dock, presents itself
 to the console as a wired Pro Controller, a USB keyboard and a USB mouse; the
 app drives it over Wi-Fi.
 
+![SwitchView showing the Switch 2 HOME menu above the controller and script panels](docs/screenshot.png)
+
 ```
  capture card ──HDMI── Switch 2 dock ──USB── Pico 2 W
       │                                          ▲
