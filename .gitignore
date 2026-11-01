@@ -4,7 +4,7 @@ firmware/build/
 firmware/secrets.cmake
 app/fonts/*.ttf
 app/fonts/*.otf
-tools/__pycache__/
+__pycache__/
 third_party/
 build/
 .viewer.lock

@@ -15,6 +15,7 @@
 struct script;
 
 struct script *script_create(struct ocr *ocr, const char *dir);
+// Main-thread lifecycle: destroy joins the worker, including any native Lua call.
 void script_destroy(struct script *s);
 
 // Scripts found in the directory (*.lua, sorted). Rescanned on demand.
@@ -23,6 +24,7 @@ const char *script_name(struct script *s, int i);
 void script_rescan(struct script *s);
 
 int script_start(struct script *s, int index);
+// Request cancellation without blocking the UI; script_running reports completion.
 void script_stop(struct script *s);
 int script_running(struct script *s);
 

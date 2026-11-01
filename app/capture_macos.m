@@ -73,6 +73,7 @@ struct capture {
 
 static NSArray<AVCaptureDevice *> *video_devices(void)
 {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
   if (@available(macOS 14.0, *)) {
     return [AVCaptureDeviceDiscoverySession
       discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeExternal,
@@ -80,6 +81,7 @@ static NSArray<AVCaptureDevice *> *video_devices(void)
                             mediaType:AVMediaTypeVideo
                              position:AVCaptureDevicePositionUnspecified].devices;
   }
+#endif
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
   return [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
@@ -166,17 +168,36 @@ static int video_authorized(void)
   return 1;
 }
 
+static int rate_in_range(double rate, double minimum, double maximum)
+{
+  return rate >= minimum - 0.001 && rate <= maximum + 0.001;
+}
+
+static double nominal_fractional_rate(int requested)
+{
+  // Conventional NTSC-family modes are selected by their nominal integer name.
+  switch (requested) {
+  case 24: case 30: case 60: case 120: case 240: return requested * 1000.0 / 1001.0;
+  default: return 0;
+  }
+}
+
 static AVCaptureDeviceFormat *select_format(AVCaptureDevice *device, const struct capture_opts *o,
                                              AVFrameRateRange **selected_range)
 {
-  for (AVCaptureDeviceFormat *format in device.formats) {
-    CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
-    if (size.width != o->width || size.height != o->height) continue;
-    for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges)
-      if (o->fps >= range.minFrameRate - 0.001 && o->fps <= range.maxFrameRate + 0.001) {
-        *selected_range = range;
-        return format;
-      }
+  // Prefer an exact integer rate before trying its conventional fractional mode.
+  for (int fractional = 0; fractional < 2; ++fractional) {
+    double rate = fractional ? nominal_fractional_rate(o->fps) : o->fps;
+    if (rate == 0) continue;
+    for (AVCaptureDeviceFormat *format in device.formats) {
+      CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+      if (size.width != o->width || size.height != o->height) continue;
+      for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges)
+        if (rate_in_range(rate, range.minFrameRate, range.maxFrameRate)) {
+          *selected_range = range;
+          return format;
+        }
+    }
   }
   fprintf(stderr, "video: %s does not support %dx%d at %d fps; available modes:\n",
           device.localizedName.UTF8String, o->width, o->height, o->fps);
@@ -212,6 +233,16 @@ static Uint32 texture_format(OSType format)
   return SDL_PIXELFORMAT_BGRA32;
 }
 
+static SDL_Texture *create_texture(SDL_Renderer *renderer, OSType format, unsigned width, unsigned height)
+{
+  // SDL's Metal backend captures the conversion mode when creating a texture.
+  SDL_SetYUVConversionMode(format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                          ? SDL_YUV_CONVERSION_JPEG
+                          : (height > 576 ? SDL_YUV_CONVERSION_BT709 : SDL_YUV_CONVERSION_BT601));
+  return SDL_CreateTexture(renderer, texture_format(format), SDL_TEXTUREACCESS_STREAMING,
+                           (int)width, (int)height);
+}
+
 static void audio_callback(void *data, Uint8 *stream, int len)
 {
   struct capture *c = data;
@@ -226,31 +257,42 @@ static void audio_callback(void *data, Uint8 *stream, int len)
   pthread_mutex_unlock(&c->audio_lock);
 }
 
+// -1 means absent; -2 means ambiguous. Numeric selection bypasses name matching.
+static int unique_audio_index(const char *wanted, int count,
+                              const char *(*device_name)(int, int))
+{
+  int match = -1;
+  for (int i = 0; i < count; ++i) {
+    const char *name = device_name(i, 1);
+    if (!name || strcmp(name, wanted)) continue;
+    if (match >= 0) return -2;
+    match = i;
+  }
+  return match;
+}
+
 static const char *audio_name(const char *selector, const char *video_name, int *valid)
 {
   *valid = 1;
   if (selector && !strcmp(selector, "default")) return NULL;
   int count = SDL_GetNumAudioDevices(1);
-  if (!selector || !*selector || !strcmp(selector, "auto")) {
-    for (int i = 0; i < count; ++i) {
-      const char *name = SDL_GetAudioDeviceName(i, 1);
-      if (name && !strcmp(name, video_name)) return name;
-    }
-    fprintf(stderr, "audio: select a capture-card input with -a (use device listing); automatic match unavailable\n");
-    *valid = 0;
-    return NULL;
-  }
+  int automatic = !selector || !*selector || !strcmp(selector, "auto");
   long index;
-  int numeric = decimal_index(selector, &index);
-  if (numeric) {
-    if (numeric > 0 && index < count) return SDL_GetAudioDeviceName((int)index, 1);
-  } else {
-    for (int i = 0; i < count; ++i) {
-      const char *name = SDL_GetAudioDeviceName(i, 1);
-      if (name && !strcmp(name, selector)) return name;
+  int numeric = automatic ? 0 : decimal_index(selector, &index);
+  if (numeric > 0 && index < count) return SDL_GetAudioDeviceName((int)index, 1);
+  if (!numeric) {
+    const char *wanted = automatic ? video_name : selector;
+    int match = unique_audio_index(wanted, count, SDL_GetAudioDeviceName);
+    if (match >= 0) return SDL_GetAudioDeviceName(match, 1);
+    if (match == -2) {
+      fprintf(stderr, "audio: input name '%s' is ambiguous; select its device index with -a\n", wanted);
+      *valid = 0;
+      return NULL;
     }
   }
-  fprintf(stderr, "audio: input '%s' not found; use device listing\n", selector);
+  if (automatic)
+    fprintf(stderr, "audio: select a capture-card input with -a (use device listing); automatic match unavailable\n");
+  else fprintf(stderr, "audio: input '%s' not found; use device listing\n", selector);
   *valid = 0;
   return NULL;
 }
@@ -377,16 +419,12 @@ struct capture *capture_open(const struct capture_opts *o, SDL_Renderer *ren)
     [receiver.output setSampleBufferDelegate:receiver queue:receiver.queue];
     [receiver.session addOutput:receiver.output];
     [receiver.session commitConfiguration];
-    c->tex = SDL_CreateTexture(ren, texture_format(c->pixel_format), SDL_TEXTUREACCESS_STREAMING,
-                               o->width, o->height);
+    c->tex = create_texture(ren, c->pixel_format, c->width, c->height);
     if (!c->tex) {
       fprintf(stderr, "video: SDL texture: %s\n", SDL_GetError());
       capture_close(c);
       return NULL;
     }
-    SDL_SetYUVConversionMode(c->pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-                            ? SDL_YUV_CONVERSION_JPEG
-                            : (c->height > 576 ? SDL_YUV_CONVERSION_BT709 : SDL_YUV_CONVERSION_BT601));
     @try {
       [receiver.session startRunning];
     } @catch (NSException *exception) {
@@ -437,17 +475,31 @@ void capture_close(struct capture *c)
   }
 }
 
+// Compute a relative wait from monotonic timestamps; spurious wakeups do not
+// restart the budget, and wall-clock corrections cannot lengthen it.
+static int remaining_wait(struct timespec deadline, struct timespec now, struct timespec *remaining)
+{
+  remaining->tv_sec = deadline.tv_sec - now.tv_sec;
+  remaining->tv_nsec = deadline.tv_nsec - now.tv_nsec;
+  if (remaining->tv_nsec < 0) { --remaining->tv_sec; remaining->tv_nsec += 1000000000L; }
+  return remaining->tv_sec >= 0 && (remaining->tv_sec || remaining->tv_nsec);
+}
+
 int capture_poll(struct capture *c, int timeout_ms)
 {
   pthread_mutex_lock(&c->frame_lock);
   if (timeout_ms > 0 && c->frame_seq == c->uploaded_seq) {
     struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += timeout_ms / 1000;
     deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000L; }
-    while (c->frame_seq == c->uploaded_seq && !atomic_load(&c->closing))
-      if (pthread_cond_timedwait(&c->frame_ready, &c->frame_lock, &deadline) != 0) break;
+    while (c->frame_seq == c->uploaded_seq && !atomic_load(&c->closing)) {
+      struct timespec now, remaining;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (!remaining_wait(deadline, now, &remaining)) break;
+      if (pthread_cond_timedwait_relative_np(&c->frame_ready, &c->frame_lock, &remaining) != 0) break;
+    }
   }
   CVPixelBufferRef image = c->frame_seq != c->uploaded_seq ? c->latest : NULL;
   if (image) {

@@ -15,6 +15,7 @@
 #define RESOCKET_MS 5000  // no echo for this long: rebuild the socket (interface may have changed)
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 
 // Text pacing: the firmware types ~10 chars/s from a 255-byte queue. A token
 // bucket lets single keystrokes go out instantly while long pastes never
@@ -45,7 +46,9 @@ static int open_socket(void)
 
 struct link *link_open(const char *host, int port)
 {
+  if (!host || port < 1 || port > 65535) return NULL;
   struct link *l = calloc(1, sizeof *l);
+  if (!l) return NULL;
   l->fd = open_socket();
   if (l->fd < 0) { perror("socket"); free(l); return NULL; }
   l->dst.sin_family = AF_INET;
@@ -90,9 +93,18 @@ void link_set_state(struct link *l, const struct link_state *s)
   l->dirty = 1;
 }
 
+static int saturating_add(int current, int delta)
+{
+  if (delta > 0 && current > INT_MAX - delta) return INT_MAX;
+  if (delta < 0 && current < INT_MIN - delta) return INT_MIN;
+  return current + delta;
+}
+
 void link_mouse(struct link *l, int dx, int dy, int wheel, unsigned buttons)
 {
-  l->mdx += dx; l->mdy += dy; l->mwheel += wheel;
+  l->mdx = saturating_add(l->mdx, dx);
+  l->mdy = saturating_add(l->mdy, dy);
+  l->mwheel = saturating_add(l->mwheel, wheel);
   if (buttons != l->mbtn) { l->mbtn = buttons; l->mdirty = 1; }
   if (dx || dy || wheel) l->mdirty = 1;
 }

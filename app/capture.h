@@ -39,7 +39,8 @@ double capture_audio_queued_ms(struct capture *c);
 // Grayscale (luma) snapshots for OCR. Any thread may call capture_want_luma;
 // the next frame capture_poll uploads is also copied out. capture_copy_luma
 // copies the latest snapshot (width*height bytes) and returns its sequence
-// number, 0 if none yet.
+// number, 0 if none yet. Passing NULL for dst only queries the sequence; it
+// does not copy pixels. A subsequent copy can return a newer sequence.
 void capture_want_luma(struct capture *c);
 unsigned capture_copy_luma(struct capture *c, uint8_t *dst);
 

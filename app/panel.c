@@ -393,6 +393,7 @@ static void stick_from_mouse(struct panel *p, int i, int mx, int my)
 struct panel *panel_create(SDL_Renderer *ren)
 {
   struct panel *p = calloc(1, sizeof *p);
+  if (!p) return NULL;
   p->ren = ren;
   p->mouse_widget = -1;
   p->hover = HOV_NONE;
