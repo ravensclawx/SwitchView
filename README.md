@@ -1,6 +1,6 @@
 # SwitchView
 
-A low-latency command center for the Nintendo Switch 2 on Linux.
+A low-latency command center for the Nintendo Switch 2 on Linux and macOS.
 
 SwitchView shows the console's screen and sound from a capture card, and puts
 a clickable Pro Controller, a keyboard, a mouse and a Lua scripting panel right
@@ -50,7 +50,7 @@ can, and the PC does all the thinking.
 
 ## Building
 
-### App
+### App (Linux)
 
 ```sh
 sudo apt install build-essential pkg-config libsdl2-dev libsdl2-ttf-dev \
@@ -61,6 +61,10 @@ make run
 
 Your user needs access to the capture device (`/dev/video0`, usually the
 `video` group) and the capture card's ALSA device.
+
+### App (macOS)
+
+See [MACOS.md](MACOS.md) for Homebrew dependencies, device selection, permissions, and capture validation. The Mac backend uses AVFoundation video and SDL/CoreAudio audio.
 
 ### Firmware
 
@@ -87,8 +91,8 @@ keyboard + mouse, `0` controller only, `2` keyboard only.
 
 | Option | |
 |---|---|
-| `-H HOST` | Pico address (default `192.168.4.60`; must match `SV_PICO_IP`) |
-| `-d DEV` / `-a PCM` | Capture video device / ALSA capture device |
+| `-H HOST` | Pico address (Linux default `192.168.4.60`; macOS default `none`; must match `SV_PICO_IP` when enabled) |
+| `-d DEV` / `-a PCM` | Capture video device / audio input (Linux ALSA; macOS SDL index or name) |
 | `-s WxH`, `-r FPS`, `-p nv12\|yuyv` | Capture mode |
 | `-v` | Enable vsync (no tearing, up to one frame more latency) |
 | `-m SCALE` | Mouse sensitivity sent to the console |

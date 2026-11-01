@@ -1,7 +1,6 @@
 // SwitchView: low-latency Elgato capture viewer + Pro Controller / keyboard
 // command panel driving a Pico 2 W that is plugged into the Switch 2 dock.
 #include <SDL2/SDL.h>
-#include <linux/videodev2.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -15,6 +14,7 @@
 #include "panel.h"
 #include "script.h"
 #include "switchview_proto.h"
+#include "viewer_util.h"
 
 static atomic_int running = 1;
 static void on_signal(int sig) { (void)sig; atomic_store(&running, 0); }
@@ -23,19 +23,22 @@ static void usage(const char *argv0)
 {
   fprintf(stderr,
           "usage: %s [options]\n"
-          "  -d DEV     video device (default /dev/video0)\n"
-          "  -a PCM     ALSA capture device (default hw:CARD=S,DEV=0)\n"
+          "  -d DEV     video device (Linux: /dev/video0; macOS: camera index/name)\n"
+          "  -a PCM     audio capture device (Linux: ALSA PCM; macOS: SDL device name)\n"
           "  -s WxH     capture size (default 1920x1080)\n"
-          "  -r FPS     frame rate (default 60)\n"
+          "  -r FPS     frame rate (Linux default 60; macOS default 30)\n"
           "  -p FMT     pixel format: nv12 | yuyv (default nv12)\n"
           "  -l MS      max audio queue in ms before dropping (default 20)\n"
-          "  -H HOST    Pico address (default 192.168.4.60); 'none' disables the link\n"
+          "  -H HOST    Pico address (Linux default 192.168.4.60; macOS default none)\n"
           "  -P PORT    Pico UDP port (default %d)\n"
           "  -v         enable vsync (no tearing, up to +1 frame latency)\n"
           "  -f         start fullscreen (video only)\n"
           "  -n         no audio\n"
           "  -m SCALE   mouse sensitivity sent to the Switch (default 1.0)\n"
           "  -V         print stats every second\n"
+#ifdef __APPLE__
+          "  -L         list macOS video/audio capture devices and exit\n"
+#endif
           "keys: F11 fullscreen (hides panel), Ctrl+Q quit, Enter focus text box, Esc back to pad\n"
           "mouse: click the video to send the mouse to the Switch; Esc gives it back\n"
           "pad:  WASD left stick, arrows right stick, TFGH d-pad, IJKL = X Y B A,\n"
@@ -46,31 +49,44 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-  struct capture_opts co = {.video_dev = "/dev/video0", .audio_dev = "hw:CARD=S,DEV=0",
-                            .width = 1920, .height = 1080, .fps = 60,
-                            .fourcc = V4L2_PIX_FMT_NV12, .audio_max_ms = 20};
+  struct capture_opts co = {
+#ifdef __APPLE__
+                            .video_dev = "0", .audio_dev = NULL, .fps = 30,
+#else
+                            .video_dev = "/dev/video0", .audio_dev = "hw:CARD=S,DEV=0", .fps = 60,
+#endif
+                            .width = 1920, .height = 1080,
+                            .fourcc = SV_PIX_FMT_NV12, .audio_max_ms = 20};
+#ifdef __APPLE__
+  const char *host = "none";
+#else
   const char *host = "192.168.4.60";
-  int port = SV_PORT, vsync = 0, fullscreen = 0, verbose = 0;
+#endif
+  int port = SV_PORT, vsync = 0, fullscreen = 0, verbose = 0, list_devices = 0;
   float mouse_scale = 1.0f;
   int c;
-  while ((c = getopt(argc, argv, "d:a:s:r:p:l:H:P:m:vfnVh")) != -1) {
+  while ((c = getopt(argc, argv, "d:a:s:r:p:l:H:P:m:vfnVLh")) != -1) {
     switch (c) {
     case 'd': co.video_dev = optarg; break;
     case 'a': co.audio_dev = optarg; break;
-    case 's': if (sscanf(optarg, "%dx%d", &co.width, &co.height) != 2) { usage(argv[0]); return 1; } break;
-    case 'r': co.fps = atoi(optarg); break;
-    case 'p': co.fourcc = !strcmp(optarg, "yuyv") ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_NV12; break;
-    case 'l': co.audio_max_ms = atoi(optarg); break;
+    case 's': if (!sv_parse_size(optarg, &co.width, &co.height)) goto invalid_option; break;
+    case 'r': if (!sv_parse_int(optarg, 1, 1000, &co.fps)) goto invalid_option; break;
+    case 'p':
+      if (strcmp(optarg, "yuyv") && strcmp(optarg, "nv12")) { usage(argv[0]); return 1; }
+      co.fourcc = !strcmp(optarg, "yuyv") ? SV_PIX_FMT_YUYV : SV_PIX_FMT_NV12; break;
+    case 'l': if (!sv_parse_int(optarg, 1, 4000, &co.audio_max_ms)) goto invalid_option; break;
     case 'H': host = optarg; break;
-    case 'P': port = atoi(optarg); break;
-    case 'm': mouse_scale = (float)atof(optarg); break;
+    case 'P': if (!sv_parse_int(optarg, 1, 65535, &port)) goto invalid_option; break;
+    case 'm': if (!sv_parse_scale(optarg, &mouse_scale)) goto invalid_option; break;
     case 'v': vsync = 1; break;
     case 'f': fullscreen = 1; break;
     case 'n': co.no_audio = 1; break;
     case 'V': verbose = 1; break;
+    case 'L': list_devices = 1; break;
     default: usage(argv[0]); return c != 'h';
     }
   }
+  if (optind != argc) goto invalid_option;
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -83,38 +99,57 @@ int main(int argc, char **argv)
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
     return 1;
   }
+  if (list_devices) {
+#ifdef __APPLE__
+    capture_list_devices();
+#else
+    fprintf(stderr, "Linux devices: use v4l2-ctl --list-devices and arecord -L.\n");
+#endif
+    SDL_Quit(); return 0;
+  }
 
-  SDL_Window *win = SDL_CreateWindow("SwitchView", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+  int result = 1;
+  SDL_Window *win = NULL;
+  SDL_Renderer *ren = NULL;
+  struct capture *cap = NULL;
+  struct link *link = NULL;
+  struct panel *panel = NULL;
+  struct ocr *ocr = NULL;
+  struct script *script = NULL;
+
+  win = SDL_CreateWindow("SwitchView", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      960, 540 + 960 * PANEL_DESIGN_H / PANEL_DESIGN_W, SDL_WINDOW_ALLOW_HIGHDPI |
                                      (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
-  SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
+  if (!win) { fprintf(stderr, "SDL window: %s\n", SDL_GetError()); goto cleanup; }
+  ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
                                          (vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
-  if (!win || !ren) { fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError()); return 1; }
+  if (!ren) { fprintf(stderr, "SDL renderer: %s\n", SDL_GetError()); goto cleanup; }
   SDL_RendererInfo ri;
   SDL_GetRendererInfo(ren, &ri);
   fprintf(stderr, "render: %s, vsync %s\n", ri.name, vsync ? "on" : "off");
 
-  struct capture *cap = capture_open(&co, ren);
-  if (!cap) return 1;
-  struct link *link = strcmp(host, "none") ? link_open(host, port) : NULL;
-  struct panel *panel = panel_create(ren);
+  cap = capture_open(&co, ren);
+  if (!cap) goto cleanup;
+  link = strcmp(host, "none") ? link_open(host, port) : NULL;
+  if (strcmp(host, "none") && !link) goto cleanup;
+  panel = panel_create(ren);
+  if (!panel) goto cleanup;
 
   // Scripts live in SwitchView/scripts, next to app/ where the binary is.
   char script_dir[1024] = "scripts";
-  ssize_t en = readlink("/proc/self/exe", script_dir, sizeof script_dir - 16);
-  if (en > 0) {
-    script_dir[en] = 0;
-    char *slash = strrchr(script_dir, '/');
-    if (slash) strcpy(slash + 1, "../scripts");
-  }
-  struct ocr *ocr = ocr_create(cap);
-  struct script *script = script_create(ocr, script_dir);
+  char *base = SDL_GetBasePath();
+  if (base) { snprintf(script_dir, sizeof script_dir, "%s../scripts", base); SDL_free(base); }
+  ocr = ocr_create(cap);
+  if (!ocr) goto cleanup;
+  script = script_create(ocr, script_dir);
+  if (!script) goto cleanup;
   panel_set_script(panel, script);
   fprintf(stderr, "link: %s\n", link ? link_describe(link) : "disabled");
 
   unsigned frames = 0;
   double fps = 0;
   Uint32 t_last = SDL_GetTicks();
+  Uint32 last_panel_refresh = t_last;
   int need_redraw = 1;
   char status[160] = "";
   int mouse_captured = 0;
@@ -122,11 +157,15 @@ int main(int argc, char **argv)
   float mute_alpha = 0;
   Uint32 last_frame_ms = SDL_GetTicks();
   unsigned mouse_btn = 0;
-  float mouse_acc_x = 0, mouse_acc_y = 0;
+  double mouse_acc_x = 0, mouse_acc_y = 0;
 
   while (atomic_load(&running)) {
-    int ww, wh;
-    SDL_GetRendererOutputSize(ren, &ww, &wh);
+    int ww, wh, logical_w, logical_h;
+    SDL_GetWindowSize(win, &logical_w, &logical_h);
+    if (SDL_GetRendererOutputSize(ren, &ww, &wh) < 0 || ww <= 0 || wh <= 0) {
+      ww = logical_w > 0 ? logical_w : 1;
+      wh = logical_h > 0 ? logical_h : 1;
+    }
     int panel_h = fullscreen ? 0 : (int)(ww * (float)PANEL_DESIGN_H / PANEL_DESIGN_W);
     SDL_Rect video_area = {0, 0, ww, wh - panel_h};
     SDL_Rect panel_area = {0, wh - panel_h, ww, panel_h};
@@ -135,6 +174,7 @@ int main(int argc, char **argv)
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+      sv_pointer_to_drawable(&e, logical_w, logical_h, ww, wh);
       if (e.type == SDL_QUIT) atomic_store(&running, 0);
       else if (e.type == SDL_KEYDOWN && (e.key.keysym.mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_q)
         atomic_store(&running, 0);
@@ -158,10 +198,8 @@ int main(int argc, char **argv)
           if (link) link_mouse(link, 0, 0, 0, mouse_btn = 0);
           need_redraw = 1;
         } else if (e.type == SDL_MOUSEMOTION) {
-          mouse_acc_x += e.motion.xrel * mouse_scale;
-          mouse_acc_y += e.motion.yrel * mouse_scale;
-          int dx = (int)mouse_acc_x, dy = (int)mouse_acc_y;
-          mouse_acc_x -= dx; mouse_acc_y -= dy;
+          int dx = sv_relative_motion(e.motion.xrel, mouse_scale, &mouse_acc_x);
+          int dy = sv_relative_motion(e.motion.yrel, mouse_scale, &mouse_acc_y);
           if (link && (dx || dy)) link_mouse(link, dx, dy, 0, mouse_btn);
         } else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) {
           unsigned bit = e.button.button == SDL_BUTTON_LEFT ? SV_MOUSE_LEFT :
@@ -225,7 +263,7 @@ int main(int argc, char **argv)
     }
 
     // Panel highlights follow held keys/gamepad even without events.
-    if (!fullscreen && (now / 33) != (t_last / 33)) need_redraw = 1;
+    if (!fullscreen && sv_refresh_due(now, &last_panel_refresh, 33)) need_redraw = 1;
 
     {
       // Mute button fades in while the pointer is over the video.
@@ -275,6 +313,8 @@ int main(int argc, char **argv)
     }
   }
 
+  result = 0;
+cleanup:
   script_destroy(script);
   ocr_destroy(ocr);
   link_close(link);
@@ -283,5 +323,10 @@ int main(int argc, char **argv)
   SDL_DestroyRenderer(ren);
   SDL_DestroyWindow(win);
   SDL_Quit();
-  return 0;
+  return result;
+
+invalid_option:
+  fprintf(stderr, "Invalid option value or unexpected argument.\n");
+  usage(argv[0]);
+  return 1;
 }

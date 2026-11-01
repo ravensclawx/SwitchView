@@ -203,9 +203,11 @@ static void video_requeue(struct capture *c, int idx)
 
 struct capture *capture_open(const struct capture_opts *o, SDL_Renderer *ren)
 {
+  if (!o || !ren) return NULL;
   struct capture *c = calloc(1, sizeof *c);
+  if (!c) return NULL;
   c->fd = -1;
-  pthread_mutex_init(&c->luma_lock, NULL);
+  if (pthread_mutex_init(&c->luma_lock, NULL) != 0) { free(c); return NULL; }
   if (video_open(c, o) < 0) { capture_close(c); return NULL; }
 
   Uint32 tex_fmt = c->fourcc == V4L2_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_YUY2;
@@ -249,13 +251,13 @@ int capture_poll(struct capture *c, int timeout_ms)
   if (atomic_exchange(&c->luma_wanted, 0)) {
     pthread_mutex_lock(&c->luma_lock);
     if (!c->luma) c->luma = malloc((size_t)c->width * c->height);
-    for (unsigned y = 0; y < c->height; y++) {
+    if (c->luma) for (unsigned y = 0; y < c->height; y++) {
       const Uint8 *row = p + (size_t)y * c->stride;
       uint8_t *out = c->luma + (size_t)y * c->width;
       if (c->fourcc == V4L2_PIX_FMT_NV12) memcpy(out, row, c->width);
       else for (unsigned x = 0; x < c->width; x++) out[x] = row[2 * x];  // YUYV
     }
-    c->luma_seq++;
+    if (c->luma && ++c->luma_seq == 0) ++c->luma_seq;
     pthread_mutex_unlock(&c->luma_lock);
   }
   if (c->fourcc == V4L2_PIX_FMT_NV12)
@@ -289,7 +291,7 @@ unsigned capture_copy_luma(struct capture *c, uint8_t *dst)
 {
   pthread_mutex_lock(&c->luma_lock);
   unsigned seq = c->luma_seq;
-  if (seq) memcpy(dst, c->luma, (size_t)c->width * c->height);
+  if (seq && dst) memcpy(dst, c->luma, (size_t)c->width * c->height);
   pthread_mutex_unlock(&c->luma_lock);
   return seq;
 }

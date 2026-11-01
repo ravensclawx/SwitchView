@@ -34,6 +34,7 @@ struct script {
   int count;
 
   pthread_t th;
+  int joinable;  // Start/stop/destroy are owned by the main thread.
   atomic_int running, stop;
 
   pthread_mutex_t lock;  // guards everything below
@@ -482,6 +483,7 @@ static void *script_thread(void *arg)
 {
   struct script *s = arg;
   lua_State *L = luaL_newstate();
+  if (!L) { logf_(s, "error: Lua allocation failed"); goto finished; }
   luaL_openlibs(L);
   lua_pushlightuserdata(L, s);
   lua_setfield(L, LUA_REGISTRYINDEX, "sv_script");
@@ -506,6 +508,7 @@ static void *script_thread(void *arg)
     logf_(s, "done (%.1f s)", (SDL_GetTicks() - t0) / 1000.0);
   }
   lua_close(L);
+finished:
   clear_input(s);
   ocr_set_enabled(s->ocr, 0);
   ocr_set_region(s->ocr, 0, 0, 0, 0);
@@ -525,8 +528,9 @@ void script_rescan(struct script *s)
   struct dirent *e;
   while ((e = readdir(d)) && s->count < MAX_SCRIPTS) {
     size_t n = strlen(e->d_name);
-    if (n > 4 && !strcmp(e->d_name + n - 4, ".lua"))
-      snprintf(s->names[s->count++], sizeof s->names[0], "%s", e->d_name);
+    // Never truncate a filename into a different script path.
+    if (n > 4 && n < sizeof s->names[0] && !strcmp(e->d_name + n - 4, ".lua"))
+      memcpy(s->names[s->count++], e->d_name, n + 1);
   }
   closedir(d);
   qsort(s->names, (size_t)s->count, sizeof s->names[0], cmp_names);
@@ -534,10 +538,12 @@ void script_rescan(struct script *s)
 
 struct script *script_create(struct ocr *ocr, const char *dir)
 {
+  if (!dir) return NULL;
   struct script *s = calloc(1, sizeof *s);
+  if (!s) return NULL;
   s->ocr = ocr;
   snprintf(s->dir, sizeof s->dir, "%s", dir);
-  pthread_mutex_init(&s->lock, NULL);
+  if (pthread_mutex_init(&s->lock, NULL) != 0) { free(s); return NULL; }
   s->input.hat = SV_HAT_CENTER;
   atomic_store(&s->leds, -1);
   script_rescan(s);
@@ -548,6 +554,8 @@ void script_destroy(struct script *s)
 {
   if (!s) return;
   script_stop(s);
+  // A Lua native call may outlive Stop; never free state while it still runs.
+  if (s->joinable) pthread_join(s->th, NULL);
   pthread_mutex_destroy(&s->lock);
   free(s);
 }
@@ -558,6 +566,7 @@ const char *script_name(struct script *s, int i) { return i >= 0 && i < s->count
 int script_start(struct script *s, int index)
 {
   if (atomic_load(&s->running) || index < 0 || index >= s->count || !s->ocr) return -1;
+  if (s->joinable) { pthread_join(s->th, NULL); s->joinable = 0; }
   pthread_mutex_lock(&s->lock);
   snprintf(s->path, sizeof s->path, "%s/%s", s->dir, s->names[index]);
   s->nrules = 0;
@@ -574,15 +583,13 @@ int script_start(struct script *s, int index)
     ocr_set_enabled(s->ocr, 0);
     return -1;
   }
-  pthread_detach(s->th);
+  s->joinable = 1;
   return 0;
 }
 
 void script_stop(struct script *s)
 {
-  if (!atomic_load(&s->running)) return;
-  atomic_store(&s->stop, 1);
-  for (int i = 0; i < 200 && atomic_load(&s->running); i++) usleep(5000);
+  if (s) atomic_store(&s->stop, 1);
 }
 
 int script_running(struct script *s) { return atomic_load(&s->running); }

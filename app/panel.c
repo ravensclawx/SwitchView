@@ -132,22 +132,25 @@ struct panel {
 static TTF_Font *open_font(int px, int bold)
 {
   char bundled[1024];
-  ssize_t n = readlink("/proc/self/exe", bundled, sizeof bundled - 40);
-  if (n > 0) {
-    bundled[n] = 0;
-    char *slash = strrchr(bundled, '/');
-    if (slash) strcpy(slash + 1, "fonts/NintendoNTLG-DB.ttf");
+  char *base = SDL_GetBasePath();
+  if (base) {
+    snprintf(bundled, sizeof bundled, "%sfonts/NintendoNTLG-DB.ttf", base);
+    SDL_free(base);
     TTF_Font *f = TTF_OpenFont(bundled, px);
     if (f) { TTF_SetFontHinting(f, TTF_HINTING_LIGHT); return f; }
   }
-  const char *paths_b[] = {"/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+  const char *paths_b[] = {"/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                           "/System/Library/Fonts/Supplemental/Arial.ttf",
+                           "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
                            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
                            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"};
-  const char *paths_r[] = {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+  const char *paths_r[] = {"/System/Library/Fonts/Supplemental/Arial.ttf",
+                           "/System/Library/Fonts/Helvetica.ttc",
+                           "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
                            "/usr/share/fonts/truetype/noto/NotoSans-Medium.ttf",
                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"};
   const char **paths = bold ? paths_b : paths_r;
-  for (int i = 0; i < 3; i++) {
+  for (unsigned i = 0; i < sizeof paths_r / sizeof paths_r[0]; i++) {
     TTF_Font *f = TTF_OpenFont(paths[i], px);
     if (f) { TTF_SetFontHinting(f, TTF_HINTING_LIGHT); return f; }
   }
@@ -390,6 +393,7 @@ static void stick_from_mouse(struct panel *p, int i, int mx, int my)
 struct panel *panel_create(SDL_Renderer *ren)
 {
   struct panel *p = calloc(1, sizeof *p);
+  if (!p) return NULL;
   p->ren = ren;
   p->mouse_widget = -1;
   p->hover = HOV_NONE;
@@ -397,6 +401,7 @@ struct panel *panel_create(SDL_Renderer *ren)
     p->font_big = open_font(21, 1);
     p->font_small = open_font(12, 0);
     p->font_sym = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19);
+    if (!p->font_sym) p->font_sym = TTF_OpenFont("/System/Library/Fonts/Apple Symbols.ttf", 19);
     if (p->font_sym) TTF_SetFontHinting(p->font_sym, TTF_HINTING_LIGHT);
     if (!p->font_big) fprintf(stderr, "panel: no TTF font found; labels disabled\n");
   }

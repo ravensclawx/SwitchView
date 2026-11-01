@@ -46,10 +46,20 @@ static void normalize(const char *in, char *out, size_t len)
   out[n] = 0;
 }
 
+/* Most polls see the old frame. Query its sequence without copying a full
+ * image, then copy exactly once when a new snapshot is available. */
+static unsigned copy_new_luma(struct capture *cap, uint8_t *frame, unsigned last_seq)
+{
+  unsigned seq = capture_copy_luma(cap, NULL);
+  if (!seq || seq == last_seq) return 0;
+  return capture_copy_luma(cap, frame);
+}
+
 static void *ocr_thread(void *arg)
 {
   struct ocr *o = arg;
   TessBaseAPI *api = TessBaseAPICreate();
+  if (!api) { fprintf(stderr, "ocr: tesseract allocation failed\n"); return NULL; }
   if (TessBaseAPIInit3(api, NULL, "eng") != 0) {
     fprintf(stderr, "ocr: tesseract init failed (is tesseract-ocr-eng installed?)\n");
     TessBaseAPIDelete(api);
@@ -60,10 +70,16 @@ static void *ocr_thread(void *arg)
   TessBaseAPISetVariable(api, "user_defined_dpi", "150");
 
   unsigned w = capture_width(o->cap), h = capture_height(o->cap);
-  uint8_t *frame = malloc((size_t)w * h);
+  uint8_t *frame = w && h && (size_t)w <= SIZE_MAX / h ? malloc((size_t)w * h) : NULL;
+  if (!frame) {
+    fprintf(stderr, "ocr: frame allocation failed\n");
+    TessBaseAPIEnd(api);
+    TessBaseAPIDelete(api);
+    return NULL;
+  }
   unsigned last_seq = 0;
   char raw_norm[TEXT_MAX];
-  static struct ocr_box boxes[OCR_MAX_BOXES];
+  struct ocr_box boxes[OCR_MAX_BOXES];
 
   while (atomic_load(&o->running)) {
     if (!atomic_load(&o->enabled)) { usleep(20000); continue; }
@@ -75,10 +91,11 @@ static void *ocr_thread(void *arg)
     // Wait (briefly) for the main loop to hand over the next frame.
     unsigned seq = 0;
     for (int i = 0; i < 100 && atomic_load(&o->running); i++) {
-      seq = capture_copy_luma(o->cap, frame);
+      seq = copy_new_luma(o->cap, frame, last_seq);
       if (seq && seq != last_seq) break;
       usleep(5000);
     }
+    if (!atomic_load(&o->running)) break;
     if (!seq || seq == last_seq) { atomic_store(&o->busy, 0); continue; }
     last_seq = seq;
 
@@ -122,7 +139,7 @@ static void *ocr_thread(void *arg)
     TessBaseAPIClear(api);
 
     pthread_mutex_lock(&o->lock);
-    memcpy(o->text, raw_norm, sizeof o->text);
+    snprintf(o->text, sizeof o->text, "%s", raw_norm);
     memcpy(o->boxes, boxes, sizeof(boxes[0]) * (size_t)nb);
     o->nboxes = nb;
     o->seq++;
@@ -139,9 +156,11 @@ static void *ocr_thread(void *arg)
 
 struct ocr *ocr_create(struct capture *cap)
 {
+  if (!cap) return NULL;
   struct ocr *o = calloc(1, sizeof *o);
+  if (!o) return NULL;
   o->cap = cap;
-  pthread_mutex_init(&o->lock, NULL);
+  if (pthread_mutex_init(&o->lock, NULL) != 0) { free(o); return NULL; }
   atomic_store(&o->running, 1);
   if (pthread_create(&o->th, NULL, ocr_thread, o) != 0) {
     pthread_mutex_destroy(&o->lock);
